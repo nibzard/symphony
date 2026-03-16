@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, ObservabilityHistory, StatusDashboard, Tracker, Workflow, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -33,12 +33,17 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      :started_at,
+      :history_path,
+      :codex_command,
+      :codex_runtime_info,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
       retry_attempts: %{},
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      history: %{}
     ]
   end
 
@@ -52,6 +57,8 @@ defmodule SymphonyElixir.Orchestrator do
   def init(_opts) do
     now_ms = System.monotonic_time(:millisecond)
     config = Config.settings!()
+    started_at = DateTime.utc_now()
+    history_path = ObservabilityHistory.default_path()
 
     state = %State{
       poll_interval_ms: config.polling.interval_ms,
@@ -60,8 +67,13 @@ defmodule SymphonyElixir.Orchestrator do
       poll_check_in_progress: false,
       tick_timer_ref: nil,
       tick_token: nil,
+      started_at: started_at,
+      history_path: history_path,
+      codex_command: config.codex.command,
+      codex_runtime_info: inspect_codex_runtime(config.codex.command),
       codex_totals: @empty_codex_totals,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      history: ObservabilityHistory.load(history_path)
     }
 
     run_terminal_workspace_cleanup()
@@ -126,7 +138,6 @@ defmodule SymphonyElixir.Orchestrator do
 
       issue_id ->
         {running_entry, state} = pop_running_entry(state, issue_id)
-        state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
 
         state =
@@ -135,6 +146,7 @@ defmodule SymphonyElixir.Orchestrator do
               Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
               state
+              |> record_session_completion(running_entry, %{result: "completed", stop_reason: "completed"})
               |> complete_issue(issue_id)
               |> schedule_issue_retry(issue_id, 1, %{
                 identifier: running_entry.identifier,
@@ -148,7 +160,12 @@ defmodule SymphonyElixir.Orchestrator do
 
               next_attempt = next_retry_attempt_from_running(running_entry)
 
-              schedule_issue_retry(state, issue_id, next_attempt, %{
+              state
+              |> record_session_completion(running_entry, %{
+                result: "agent exited: #{inspect(reason)}",
+                stop_reason: "agent_error"
+              })
+              |> schedule_issue_retry(issue_id, next_attempt, %{
                 identifier: running_entry.identifier,
                 error: "agent exited: #{inspect(reason)}",
                 worker_host: Map.get(running_entry, :worker_host),
@@ -349,7 +366,10 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, true)
+        terminate_running_issue(state, issue.id, true,
+          stop_reason: "terminal_state",
+          to_state: issue.state
+        )
 
       !issue_routable_to_worker?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
@@ -362,7 +382,10 @@ defmodule SymphonyElixir.Orchestrator do
       true ->
         Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, false)
+        terminate_running_issue(state, issue.id, false,
+          stop_reason: "state_changed",
+          to_state: issue.state
+        )
     end
   end
 
@@ -412,14 +435,18 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace) do
+  defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace, opts \\ []) do
     case Map.get(state.running, issue_id) do
       nil ->
         release_issue_claim(state, issue_id)
 
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
-        state = record_session_completion_totals(state, running_entry)
         worker_host = Map.get(running_entry, :worker_host)
+
+        result =
+          issue_termination_result(cleanup_workspace, running_entry, Enum.into(opts, %{}))
+
+        state = record_session_completion(state, running_entry, result)
 
         if cleanup_workspace do
           cleanup_issue_workspace(identifier, worker_host)
@@ -793,20 +820,34 @@ defmodule SymphonyElixir.Orchestrator do
 
     Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt})#{error_suffix}")
 
-    %{
-      state
-      | retry_attempts:
-          Map.put(state.retry_attempts, issue_id, %{
-            attempt: next_attempt,
-            timer_ref: timer_ref,
-            retry_token: retry_token,
-            due_at_ms: due_at_ms,
-            identifier: identifier,
-            error: error,
-            worker_host: worker_host,
-            workspace_path: workspace_path
-          })
-    }
+    state
+    |> record_retry_history(%{
+      issue_id: issue_id,
+      issue_identifier: identifier,
+      attempt: next_attempt,
+      error: error,
+      scheduled_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+      delay_ms: delay_ms,
+      due_at: due_at_iso8601(due_at_ms),
+      worker_host: worker_host,
+      workspace_path: workspace_path
+    })
+    |> then(fn updated_state ->
+      %{
+        updated_state
+        | retry_attempts:
+            Map.put(updated_state.retry_attempts, issue_id, %{
+              attempt: next_attempt,
+              timer_ref: timer_ref,
+              retry_token: retry_token,
+              due_at_ms: due_at_ms,
+              identifier: identifier,
+              error: error,
+              worker_host: worker_host,
+              workspace_path: workspace_path
+            })
+      }
+    end)
   end
 
   defp pop_retry_attempt_state(%State{} = state, issue_id, retry_token) when is_reference(retry_token) do
@@ -1146,6 +1187,8 @@ defmodule SymphonyElixir.Orchestrator do
        retrying: retrying,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
+       runtime: runtime_snapshot(state),
+       history: history_snapshot(state),
        polling: %{
          checking?: state.poll_check_in_progress == true,
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
@@ -1274,33 +1317,342 @@ defmodule SymphonyElixir.Orchestrator do
     {Map.get(state.running, issue_id), %{state | running: Map.delete(state.running, issue_id)}}
   end
 
-  defp record_session_completion_totals(state, running_entry) when is_map(running_entry) do
-    runtime_seconds = running_seconds(running_entry.started_at, DateTime.utc_now())
+  defp record_session_completion(state, running_entry, result) when is_map(running_entry) do
+    finished_at = DateTime.utc_now() |> DateTime.truncate(:second)
+    runtime_seconds = running_seconds(running_entry.started_at, finished_at)
+    result_metadata = session_result_metadata(result, running_entry)
+
+    totals = %{
+      input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
+      output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
+      total_tokens: Map.get(running_entry, :codex_total_tokens, 0),
+      seconds_running: runtime_seconds
+    }
 
     codex_totals =
-      apply_token_delta(
-        state.codex_totals,
-        %{
-          input_tokens: 0,
-          output_tokens: 0,
-          total_tokens: 0,
-          seconds_running: runtime_seconds
-        }
-      )
+      apply_token_delta(state.codex_totals, %{
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        seconds_running: runtime_seconds
+      })
 
-    %{state | codex_totals: codex_totals}
+    history =
+      state.history
+      |> ObservabilityHistory.append_session(%{
+        issue_id: running_entry.issue.id,
+        issue_identifier: running_entry.identifier,
+        issue_state: result_metadata.issue_state,
+        session_id: running_entry_session_id(running_entry),
+        turn_count: Map.get(running_entry, :turn_count, 0),
+        started_at: iso8601(running_entry.started_at),
+        finished_at: iso8601(finished_at),
+        runtime_seconds: runtime_seconds,
+        last_event: Map.get(running_entry, :last_codex_event),
+        result: result_metadata.result,
+        stop_reason: result_metadata.stop_reason,
+        from_state: result_metadata.from_state,
+        to_state: result_metadata.to_state,
+        workspace_path: Map.get(running_entry, :workspace_path),
+        worker_host: Map.get(running_entry, :worker_host),
+        totals: totals
+      })
+
+    persist_history(state.history_path, history)
+    %{state | codex_totals: codex_totals, history: history}
   end
 
-  defp record_session_completion_totals(state, _running_entry), do: state
+  defp record_session_completion(state, _running_entry, _result), do: state
+
+  defp record_retry_history(%State{} = state, retry_entry) when is_map(retry_entry) do
+    history = ObservabilityHistory.append_retry(state.history, retry_entry)
+    persist_history(state.history_path, history)
+    %{state | history: history}
+  end
+
+  defp record_retry_history(state, _retry_entry), do: state
 
   defp refresh_runtime_config(%State{} = state) do
     config = Config.settings!()
+    codex_command = config.codex.command
+
+    codex_runtime_info =
+      if state.codex_command == codex_command and is_map(state.codex_runtime_info) do
+        state.codex_runtime_info
+      else
+        inspect_codex_runtime(codex_command)
+      end
 
     %{
       state
       | poll_interval_ms: config.polling.interval_ms,
-        max_concurrent_agents: config.agent.max_concurrent_agents
+        max_concurrent_agents: config.agent.max_concurrent_agents,
+        codex_command: codex_command,
+        codex_runtime_info: codex_runtime_info
     }
+  end
+
+  defp runtime_snapshot(%State{} = state) do
+    config = Config.settings!()
+    workflow_path = Workflow.workflow_file_path()
+
+    %{
+      app: %{
+        version: app_version(),
+        escript_path: to_string(:escript.script_name())
+      },
+      system: %{
+        hostname: hostname(),
+        node: Atom.to_string(Node.self()),
+        pid: inspect(self()),
+        os_pid: to_string(:os.getpid())
+      },
+      runtime: %{
+        started_at: iso8601(state.started_at),
+        history_path: state.history_path
+      },
+      workflow: workflow_runtime_info(workflow_path),
+      config: %{
+        server: %{
+          host: config.server.host,
+          port: config.server.port
+        },
+        polling: %{
+          interval_ms: config.polling.interval_ms
+        },
+        agent: %{
+          max_concurrent_agents: config.agent.max_concurrent_agents,
+          max_concurrent_agents_by_state: config.agent.max_concurrent_agents_by_state
+        },
+        tracker: %{
+          kind: config.tracker.kind,
+          project_slug: config.tracker.project_slug,
+          active_states: config.tracker.active_states,
+          terminal_states: config.tracker.terminal_states
+        },
+        codex: Map.merge(%{command: config.codex.command}, state.codex_runtime_info || %{}),
+        workspace_root: config.workspace.root,
+        worker_hosts: config.worker.ssh_hosts
+      }
+    }
+  end
+
+  defp history_snapshot(%State{} = state) do
+    %{
+      lifetime_codex_totals: Map.get(state.history, :lifetime_codex_totals, @empty_codex_totals),
+      recent_sessions: Map.get(state.history, :recent_sessions, []),
+      recent_retries: Map.get(state.history, :recent_retries, [])
+    }
+  end
+
+  defp workflow_runtime_info(path) when is_binary(path) do
+    sha256 =
+      with {:ok, content} <- File.read(path) do
+        :crypto.hash(:sha256, content) |> Base.encode16(case: :lower)
+      else
+        _ -> nil
+      end
+
+    mtime =
+      with {:ok, stat} <- File.stat(path, time: :posix),
+           {:ok, datetime} <- DateTime.from_unix(stat.mtime) do
+        iso8601(datetime)
+      else
+        _ -> nil
+      end
+
+    %{
+      path: path,
+      sha256: sha256,
+      mtime: mtime
+    }
+  end
+
+  defp workflow_runtime_info(_path), do: %{path: nil, sha256: nil, mtime: nil}
+
+  defp persist_history(path, history) when is_binary(path) and is_map(history) do
+    ObservabilityHistory.persist(history, path)
+  end
+
+  defp persist_history(_path, _history), do: :ok
+
+  defp due_at_iso8601(due_at_ms) when is_integer(due_at_ms) do
+    DateTime.utc_now()
+    |> DateTime.add(div(max(0, due_at_ms - System.monotonic_time(:millisecond)), 1_000), :second)
+    |> DateTime.truncate(:second)
+    |> DateTime.to_iso8601()
+  end
+
+  defp due_at_iso8601(_due_at_ms), do: nil
+
+  defp iso8601(%DateTime{} = datetime) do
+    datetime
+    |> DateTime.truncate(:second)
+    |> DateTime.to_iso8601()
+  end
+
+  defp iso8601(_datetime), do: nil
+
+  defp issue_termination_result(true, running_entry, opts) do
+    from_state = running_entry_issue_state(running_entry)
+    to_state = Map.get(opts, :to_state)
+
+    %{
+      result: "moved to terminal state",
+      stop_reason: Map.get(opts, :stop_reason),
+      from_state: from_state,
+      to_state: to_state
+    }
+  end
+
+  defp issue_termination_result(false, running_entry, opts) do
+    current_state = running_entry_issue_state(running_entry)
+
+    %{
+      result:
+        case current_state do
+          state when is_binary(state) -> "stopped in state #{state}"
+          _ -> "stopped"
+        end,
+      stop_reason: Map.get(opts, :stop_reason),
+      from_state: current_state,
+      to_state: Map.get(opts, :to_state)
+    }
+  end
+
+  defp session_result_metadata(result, running_entry) when is_map(result) do
+    from_state = Map.get(result, :from_state) || running_entry_issue_state(running_entry)
+    to_state = Map.get(result, :to_state)
+
+    %{
+      result: Map.get(result, :result) || "completed",
+      stop_reason: Map.get(result, :stop_reason),
+      from_state: from_state,
+      to_state: to_state,
+      issue_state: to_state || from_state
+    }
+  end
+
+  defp session_result_metadata(result, running_entry) do
+    current_state = running_entry_issue_state(running_entry)
+
+    %{
+      result: result,
+      stop_reason: nil,
+      from_state: current_state,
+      to_state: nil,
+      issue_state: current_state
+    }
+  end
+
+  defp running_entry_issue_state(running_entry) when is_map(running_entry) do
+    case Map.get(running_entry, :issue) do
+      %Issue{state: state} when is_binary(state) -> state
+      _ -> nil
+    end
+  end
+
+  defp running_entry_issue_state(_running_entry), do: nil
+
+  defp app_version do
+    case Application.spec(:symphony_elixir, :vsn) do
+      nil -> "dev"
+      version when is_list(version) -> to_string(version)
+      version -> to_string(version)
+    end
+  end
+
+  defp hostname do
+    case :inet.gethostname() do
+      {:ok, host} -> to_string(host)
+      _ -> "unknown"
+    end
+  end
+
+  defp inspect_codex_runtime(command) when is_binary(command) do
+    parsed = parse_codex_command(command)
+    binary_name = Map.get(parsed, :binary_name)
+    binary_path = if is_binary(binary_name), do: System.find_executable(binary_name), else: nil
+
+    %{
+      binary_name: binary_name,
+      binary_path: binary_path && to_string(binary_path),
+      binary_version: codex_binary_version(binary_path || binary_name),
+      model: Map.get(parsed, :model),
+      reasoning_effort: Map.get(parsed, :reasoning_effort)
+    }
+  end
+
+  defp inspect_codex_runtime(_command) do
+    %{
+      binary_name: nil,
+      binary_path: nil,
+      binary_version: nil,
+      model: nil,
+      reasoning_effort: nil
+    }
+  end
+
+  defp parse_codex_command(command) do
+    tokens =
+      Regex.scan(~r/"[^"]*"|'[^']*'|\S+/, command)
+      |> List.flatten()
+
+    %{
+      binary_name: extract_command_binary(tokens),
+      model: capture_flag_value(command, ~r/(?:^|\s)--model\s+("[^"]+"|'[^']+'|\S+)/),
+      reasoning_effort:
+        capture_flag_value(
+          command,
+          ~r/model_reasoning_effort=(?:"([^"]+)"|'([^']+)'|([^\s"']+))/
+        )
+    }
+  end
+
+  defp extract_command_binary(["env" | rest]), do: extract_command_binary(rest)
+
+  defp extract_command_binary([token | rest]) do
+    if String.contains?(token, "=") and not String.starts_with?(token, ["./", "/"]) do
+      extract_command_binary(rest)
+    else
+      strip_shell_quotes(token)
+    end
+  end
+
+  defp extract_command_binary([]), do: nil
+
+  defp capture_flag_value(command, regex) when is_binary(command) do
+    case Regex.run(regex, command, capture: :all_but_first) do
+      nil ->
+        nil
+
+      captures ->
+        captures
+        |> Enum.find(&(is_binary(&1) and String.trim(&1) != ""))
+        |> strip_shell_quotes()
+    end
+  end
+
+  defp codex_binary_version(nil), do: nil
+
+  defp codex_binary_version(binary) when is_binary(binary) do
+    case System.cmd(binary, ["--version"], stderr_to_stdout: true) do
+      {output, 0} -> String.trim(output)
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp strip_shell_quotes(nil), do: nil
+
+  defp strip_shell_quotes(value) when is_binary(value) do
+    value
+    |> String.trim()
+    |> String.trim_leading("\"")
+    |> String.trim_trailing("\"")
+    |> String.trim_leading("'")
+    |> String.trim_trailing("'")
   end
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do

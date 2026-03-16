@@ -15,18 +15,33 @@ defmodule SymphonyElixirWeb.StaticAssets do
   @phoenix_html_js File.read!(@phoenix_html_js_path)
   @phoenix_js File.read!(@phoenix_js_path)
   @phoenix_live_view_js File.read!(@phoenix_live_view_js_path)
+  @dashboard_css_version :crypto.hash(:sha256, @dashboard_css) |> Base.url_encode64(padding: false) |> binary_part(0, 12)
+  @phoenix_html_js_version :crypto.hash(:sha256, @phoenix_html_js) |> Base.url_encode64(padding: false) |> binary_part(0, 12)
+  @phoenix_js_version :crypto.hash(:sha256, @phoenix_js) |> Base.url_encode64(padding: false) |> binary_part(0, 12)
+
+  @phoenix_live_view_js_version :crypto.hash(:sha256, @phoenix_live_view_js)
+                                |> Base.url_encode64(padding: false)
+                                |> binary_part(0, 12)
 
   @assets %{
-    "/dashboard.css" => {"text/css", @dashboard_css},
-    "/vendor/phoenix_html/phoenix_html.js" => {"application/javascript", @phoenix_html_js},
-    "/vendor/phoenix/phoenix.js" => {"application/javascript", @phoenix_js},
-    "/vendor/phoenix_live_view/phoenix_live_view.js" => {"application/javascript", @phoenix_live_view_js}
+    "/dashboard.css" => {"text/css", @dashboard_css, @dashboard_css_version},
+    "/vendor/phoenix_html/phoenix_html.js" => {"application/javascript", @phoenix_html_js, @phoenix_html_js_version},
+    "/vendor/phoenix/phoenix.js" => {"application/javascript", @phoenix_js, @phoenix_js_version},
+    "/vendor/phoenix_live_view/phoenix_live_view.js" => {"application/javascript", @phoenix_live_view_js, @phoenix_live_view_js_version}
   }
 
   @spec fetch(String.t()) :: {:ok, String.t(), binary()} | :error
   def fetch(path) when is_binary(path) do
     case Map.fetch(@assets, path) do
-      {:ok, {content_type, body}} -> {:ok, content_type, body}
+      {:ok, {content_type, body, _version}} -> {:ok, content_type, body}
+      :error -> :error
+    end
+  end
+
+  @spec version(String.t()) :: {:ok, String.t()} | :error
+  def version(path) when is_binary(path) do
+    case Map.fetch(@assets, path) do
+      {:ok, {_content_type, _body, version}} -> {:ok, version}
       :error -> :error
     end
   end

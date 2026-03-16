@@ -376,7 +376,64 @@ defmodule SymphonyElixir.ExtensionsTest do
                "total_tokens" => 12,
                "seconds_running" => 42.5
              },
-             "rate_limits" => %{"primary" => %{"remaining" => 11}}
+             "rate_limits" => %{"primary" => %{"remaining" => 11}},
+             "runtime" => %{
+               "app" => %{"version" => "0.1.0", "escript_path" => "/tmp/symphony"},
+               "system" => %{
+                 "hostname" => "test-host",
+                 "node" => "nonode@nohost",
+                 "pid" => "#PID<0.1.0>",
+                 "os_pid" => "123"
+               },
+               "runtime" => %{
+                 "started_at" => "2026-03-16T07:00:00Z",
+                 "history_path" => "/tmp/observability_history.json"
+               },
+               "workflow" => %{
+                 "path" => "/tmp/WORKFLOW.md",
+                 "sha256" => String.duplicate("a", 64),
+                 "mtime" => "2026-03-16T06:59:00Z"
+               },
+               "config" => %{
+                 "server" => %{"host" => "127.0.0.1", "port" => 4001},
+                 "tracker" => %{"active_states" => ["Todo", "In Progress", "In Review"]},
+                 "codex" => %{
+                   "binary_name" => "codex",
+                   "binary_path" => "/usr/bin/codex",
+                   "binary_version" => "codex-cli 0.114.0",
+                   "model" => "gpt-5.4",
+                   "reasoning_effort" => "high"
+                 }
+               }
+             },
+             "history" => %{
+               "lifetime_codex_totals" => %{
+                 "input_tokens" => 10,
+                 "output_tokens" => 5,
+                 "total_tokens" => 15,
+                 "seconds_running" => 75
+               },
+               "recent_sessions" => [
+                 %{
+                   "issue_identifier" => "MT-100",
+                   "issue_state" => "Done",
+                   "session_id" => "thread-history",
+                   "finished_at" => "2026-03-16T06:58:00Z",
+                   "runtime_seconds" => 75,
+                   "result" => "completed",
+                   "totals" => %{"total_tokens" => 15}
+                 }
+               ],
+               "recent_retries" => [
+                 %{
+                   "issue_identifier" => "MT-RETRY",
+                   "attempt" => 2,
+                   "scheduled_at" => "2026-03-16T06:57:00Z",
+                   "due_at" => "2026-03-16T06:58:00Z",
+                   "error" => "boom"
+                 }
+               ]
+             }
            }
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")
@@ -495,10 +552,14 @@ defmodule SymphonyElixir.ExtensionsTest do
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
     html = html_response(get(build_conn(), "/"), 200)
-    assert html =~ "/dashboard.css"
-    assert html =~ "/vendor/phoenix_html/phoenix_html.js"
-    assert html =~ "/vendor/phoenix/phoenix.js"
-    assert html =~ "/vendor/phoenix_live_view/phoenix_live_view.js"
+    assert html =~ "/dashboard.css?v="
+    assert html =~ "/vendor/phoenix_html/phoenix_html.js?v="
+    assert html =~ "/vendor/phoenix/phoenix.js?v="
+    assert html =~ "/vendor/phoenix_live_view/phoenix_live_view.js?v="
+    assert html =~ "copyDashboardText"
+    assert html =~ "setDashboardSocketState"
+    assert html =~ "dashboard-live-connected"
+    refute html =~ "navigator.clipboard.writeText(this.dataset.copy)"
     refute html =~ "/assets/app.js"
     refute html =~ "<style>"
 
@@ -507,6 +568,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert dashboard_css =~ ".status-badge-live"
     assert dashboard_css =~ "[data-phx-main].phx-connected .status-badge-live"
     assert dashboard_css =~ "[data-phx-main].phx-connected .status-badge-offline"
+    assert dashboard_css =~ ".mobile-list"
+    assert dashboard_css =~ ".desktop-table-wrap"
+    assert dashboard_css =~ "@media (max-width: 720px)"
 
     phoenix_html_js = response(get(build_conn(), "/vendor/phoenix_html/phoenix_html.js"), 200)
     assert phoenix_html_js =~ "phoenix.link.click"
@@ -543,11 +607,29 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
     assert html =~ "rendered"
-    assert html =~ "Runtime"
-    assert html =~ "Live"
-    assert html =~ "Offline"
+    assert html =~ "Process uptime"
+    assert html =~ "Socket live"
+    assert html =~ "Socket offline"
+    assert html =~ "Retry pressure"
+    assert html =~ "Snapshot age"
+    assert html =~ "Stalled"
+    assert html =~ "Needs attention"
+    assert html =~ "Runtime identity"
+    assert html =~ "Runtime history"
+    assert html =~ "History file"
+    assert html =~ "Lifetime tokens"
+    assert html =~ "Model / effort"
+    assert html =~ "Agent CLI"
+    assert html =~ "gpt-5.4"
+    assert html =~ "codex-cli 0.114.0"
     assert html =~ "Copy ID"
+    assert html =~ "Activity"
+    assert html =~ "Starting"
     assert html =~ "Codex update"
+    assert html =~ "Runtime and turns"
+    assert html =~ "Last update"
+    assert html =~ "Total tokens"
+    assert html =~ "Due at"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
@@ -605,6 +687,128 @@ defmodule SymphonyElixir.ExtensionsTest do
     {:ok, _view, html} = live(build_conn(), "/")
     assert html =~ "Snapshot unavailable"
     assert html =~ "snapshot_unavailable"
+  end
+
+  test "dashboard groups repeated history failures and truncates noisy error details" do
+    orchestrator_name = Module.concat(__MODULE__, :GroupedHistoryDashboardOrchestrator)
+
+    snapshot =
+      static_snapshot()
+      |> put_in(
+        [:history, :recent_sessions],
+        [
+          %{
+            issue_identifier: "DIS-15",
+            issue_state: "In Review",
+            session_id: "n/a",
+            finished_at: "2026-03-16T11:45:03Z",
+            started_at: "2026-03-16T11:45:02Z",
+            runtime_seconds: 0,
+            result:
+              "agent exited: {%RuntimeError{message: \"Agent run failed: {:workspace_hook_failed, \\\"before_run\\\", 1, \\\"mise.toml is not trusted\\\"}\"}, [{SymphonyElixir.AgentRunner, :run, 3, []}]}",
+            totals: %{total_tokens: 0}
+          },
+          %{
+            issue_identifier: "DIS-15",
+            issue_state: "In Review",
+            session_id: "n/a",
+            finished_at: "2026-03-16T11:43:42Z",
+            started_at: "2026-03-16T11:43:41Z",
+            runtime_seconds: 0,
+            result:
+              "agent exited: {%RuntimeError{message: \"Agent run failed: {:workspace_hook_failed, \\\"before_run\\\", 1, \\\"mise.toml is not trusted\\\"}\"}, [{SymphonyElixir.AgentRunner, :run, 3, []}]}",
+            totals: %{total_tokens: 0}
+          }
+        ]
+      )
+      |> put_in(
+        [:history, :recent_retries],
+        [
+          %{
+            issue_identifier: "DIS-15",
+            attempt: 5,
+            scheduled_at: "2026-03-16T11:45:03Z",
+            due_at: "2026-03-16T11:47:43Z",
+            error:
+              "agent exited: {%RuntimeError{message: \"Agent run failed: {:workspace_hook_failed, \\\"before_run\\\", 1, \\\"mise.toml is not trusted\\\"}\"}, [{SymphonyElixir.AgentRunner, :run, 3, []}]}"
+          },
+          %{
+            issue_identifier: "DIS-15",
+            attempt: 4,
+            scheduled_at: "2026-03-16T11:43:42Z",
+            due_at: "2026-03-16T11:45:02Z",
+            error:
+              "agent exited: {%RuntimeError{message: \"Agent run failed: {:workspace_hook_failed, \\\"before_run\\\", 1, \\\"mise.toml is not trusted\\\"}\"}, [{SymphonyElixir.AgentRunner, :run, 3, []}]}"
+          }
+        ]
+      )
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: %{queued: true, coalesced: true, requested_at: DateTime.utc_now(), operations: ["poll"]}
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    assert html =~ "before_run failed: workspace mise.toml was not trusted"
+    assert html =~ "x2"
+    refute html =~ "SymphonyElixir.AgentRunner"
+  end
+
+  test "dashboard renders state transition history summaries from structured metadata" do
+    orchestrator_name = Module.concat(__MODULE__, :TransitionHistoryDashboardOrchestrator)
+
+    snapshot =
+      static_snapshot()
+      |> put_in(
+        [:history, :recent_sessions],
+        [
+          %{
+            issue_identifier: "DIS-20",
+            issue_state: "Done",
+            session_id: "thread-done",
+            finished_at: "2026-03-16T12:00:00Z",
+            started_at: "2026-03-16T11:58:00Z",
+            runtime_seconds: 120,
+            result: "moved to terminal state",
+            stop_reason: "terminal_state",
+            from_state: "In Review",
+            to_state: "Done",
+            totals: %{total_tokens: 42}
+          },
+          %{
+            issue_identifier: "DIS-21",
+            issue_state: "In Review",
+            session_id: "thread-review",
+            finished_at: "2026-03-16T12:01:00Z",
+            started_at: "2026-03-16T11:59:00Z",
+            runtime_seconds: 90,
+            result: "stopped in state In Progress",
+            stop_reason: "state_changed",
+            from_state: "In Progress",
+            to_state: "In Review",
+            totals: %{total_tokens: 17}
+          }
+        ]
+      )
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: %{queued: true, coalesced: true, requested_at: DateTime.utc_now(), operations: ["poll"]}
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    assert html =~ "landed and moved to Done"
+    assert html =~ "stopped after state transition to In Review"
   end
 
   test "http server serves embedded assets, accepts form posts, and rejects invalid hosts" do
@@ -712,7 +916,47 @@ defmodule SymphonyElixir.ExtensionsTest do
         }
       ],
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
-      rate_limits: %{"primary" => %{"remaining" => 11}}
+      rate_limits: %{"primary" => %{"remaining" => 11}},
+      runtime: %{
+        app: %{version: "0.1.0", escript_path: "/tmp/symphony"},
+        system: %{hostname: "test-host", node: "nonode@nohost", pid: "#PID<0.1.0>", os_pid: "123"},
+        runtime: %{started_at: "2026-03-16T07:00:00Z", history_path: "/tmp/observability_history.json"},
+        workflow: %{path: "/tmp/WORKFLOW.md", sha256: String.duplicate("a", 64), mtime: "2026-03-16T06:59:00Z"},
+        config: %{
+          server: %{host: "127.0.0.1", port: 4001},
+          tracker: %{active_states: ["Todo", "In Progress", "In Review"]},
+          codex: %{
+            binary_name: "codex",
+            binary_path: "/usr/bin/codex",
+            binary_version: "codex-cli 0.114.0",
+            model: "gpt-5.4",
+            reasoning_effort: "high"
+          }
+        }
+      },
+      history: %{
+        lifetime_codex_totals: %{input_tokens: 10, output_tokens: 5, total_tokens: 15, seconds_running: 75},
+        recent_sessions: [
+          %{
+            issue_identifier: "MT-100",
+            issue_state: "Done",
+            session_id: "thread-history",
+            finished_at: "2026-03-16T06:58:00Z",
+            runtime_seconds: 75,
+            result: "completed",
+            totals: %{total_tokens: 15}
+          }
+        ],
+        recent_retries: [
+          %{
+            issue_identifier: "MT-RETRY",
+            attempt: 2,
+            scheduled_at: "2026-03-16T06:57:00Z",
+            due_at: "2026-03-16T06:58:00Z",
+            error: "boom"
+          }
+        ]
+      }
     }
   end
 

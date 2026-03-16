@@ -199,6 +199,175 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert is_integer(completed_state.codex_totals.seconds_running)
   end
 
+  test "orchestrator snapshot exposes runtime identity and persists observability history" do
+    history_path =
+      Path.join(System.tmp_dir!(), "symphony-observability-history-#{System.unique_integer([:positive])}.json")
+
+    previous_history_path = Application.get_env(:symphony_elixir, :observability_history_path)
+
+    if is_nil(previous_history_path) do
+      on_exit(fn -> Application.delete_env(:symphony_elixir, :observability_history_path) end)
+    else
+      on_exit(fn -> Application.put_env(:symphony_elixir, :observability_history_path, previous_history_path) end)
+    end
+
+    Application.put_env(:symphony_elixir, :observability_history_path, history_path)
+
+    File.write!(
+      history_path,
+      Jason.encode!(%{
+        lifetime_codex_totals: %{input_tokens: 9, output_tokens: 3, total_tokens: 12, seconds_running: 55},
+        recent_sessions: [],
+        recent_retries: []
+      })
+    )
+
+    issue_id = "issue-runtime-history"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-250",
+      title: "Runtime history test",
+      description: "Persist runtime-only observability data",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-250"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :RuntimeHistoryOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = make_ref()
+
+    running_entry = %{
+      pid: self(),
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-runtime-history",
+      turn_count: 2,
+      last_codex_message: "final update",
+      last_codex_timestamp: DateTime.utc_now(),
+      last_codex_event: :notification,
+      codex_input_tokens: 5,
+      codex_output_tokens: 7,
+      codex_total_tokens: 12,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, {:DOWN, process_ref, :process, self(), :shutdown})
+
+    snapshot =
+      wait_for_snapshot(pid, fn current ->
+        recent_sessions = current.history.recent_sessions || []
+        recent_retries = current.history.recent_retries || []
+        recent_sessions != [] and recent_retries != []
+      end)
+
+    assert snapshot.runtime.app.version == "0.1.0"
+    assert snapshot.runtime.runtime.history_path == history_path
+    assert snapshot.runtime.workflow.path == Workflow.workflow_file_path()
+    assert snapshot.history.lifetime_codex_totals.total_tokens == 24
+
+    [session_entry | _] = snapshot.history.recent_sessions
+    assert session_entry.issue_identifier == "MT-250"
+    assert session_entry.session_id == "thread-runtime-history"
+    assert session_entry.totals.total_tokens == 12
+    assert session_entry.stop_reason == "agent_error"
+    assert session_entry.from_state == "In Progress"
+    assert session_entry.to_state == nil
+
+    [retry_entry | _] = snapshot.history.recent_retries
+    assert retry_entry.issue_identifier == "MT-250"
+    assert retry_entry.attempt == 1
+    assert retry_entry.error == "agent exited: :shutdown"
+
+    persisted = Jason.decode!(File.read!(history_path))
+    assert get_in(persisted, ["lifetime_codex_totals", "total_tokens"]) == 24
+    assert hd(persisted["recent_sessions"])["issue_identifier"] == "MT-250"
+    assert hd(persisted["recent_sessions"])["stop_reason"] == "agent_error"
+    assert hd(persisted["recent_retries"])["issue_identifier"] == "MT-250"
+  end
+
+  test "reconciling a terminal state records transition metadata in session history" do
+    history_path =
+      Path.join(System.tmp_dir!(), "symphony-observability-history-#{System.unique_integer([:positive])}.json")
+
+    issue_id = "issue-terminal-transition"
+
+    running_issue = %Issue{
+      id: issue_id,
+      identifier: "MT-260",
+      title: "Terminal transition test",
+      description: "Record terminal transition history",
+      state: "In Review",
+      url: "https://example.org/issues/MT-260"
+    }
+
+    updated_issue = %{running_issue | state: "Done"}
+
+    orchestrator_name = Module.concat(__MODULE__, :TerminalTransitionOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: nil,
+      ref: nil,
+      identifier: running_issue.identifier,
+      issue: running_issue,
+      session_id: "thread-terminal-transition",
+      turn_count: 3,
+      started_at: DateTime.utc_now(),
+      codex_input_tokens: 2,
+      codex_output_tokens: 3,
+      codex_total_tokens: 5
+    }
+
+    state =
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+      |> Map.put(:history_path, history_path)
+      |> Map.put(:history, SymphonyElixir.ObservabilityHistory.default_history())
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([updated_issue], state)
+
+    assert updated_state.running == %{}
+
+    [session_entry | _] = updated_state.history.recent_sessions
+    assert session_entry.issue_identifier == "MT-260"
+    assert session_entry.issue_state == "Done"
+    assert session_entry.result == "moved to terminal state"
+    assert session_entry.stop_reason == "terminal_state"
+    assert session_entry.from_state == "In Review"
+    assert session_entry.to_state == "Done"
+
+    persisted = Jason.decode!(File.read!(history_path))
+    assert hd(persisted["recent_sessions"])["stop_reason"] == "terminal_state"
+    assert hd(persisted["recent_sessions"])["from_state"] == "In Review"
+    assert hd(persisted["recent_sessions"])["to_state"] == "Done"
+    assert hd(persisted["recent_sessions"])["issue_state"] == "Done"
+  end
+
   test "orchestrator snapshot tracks turn completed usage when present" do
     issue_id = "issue-turn-completed-usage"
 

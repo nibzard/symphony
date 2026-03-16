@@ -20,7 +20,9 @@ defmodule SymphonyElixirWeb.Presenter do
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           codex_totals: snapshot.codex_totals,
-          rate_limits: snapshot.rate_limits
+          rate_limits: snapshot.rate_limits,
+          runtime: Map.get(snapshot, :runtime, %{}),
+          history: normalize_history_payload(Map.get(snapshot, :history, %{}))
         }
 
       :timeout ->
@@ -197,4 +199,20 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp iso8601(_datetime), do: nil
+
+  defp normalize_history_payload(history) when is_map(history) do
+    %{
+      lifetime_codex_totals: Map.get(history, :lifetime_codex_totals) || Map.get(history, "lifetime_codex_totals") || %{},
+      recent_sessions: Map.get(history, :recent_sessions) || Map.get(history, "recent_sessions") || [],
+      recent_retries: Map.get(history, :recent_retries) || Map.get(history, "recent_retries") || []
+    }
+  end
+
+  defp normalize_history_payload(_history) do
+    %{
+      lifetime_codex_totals: %{},
+      recent_sessions: [],
+      recent_retries: []
+    }
+  end
 end
