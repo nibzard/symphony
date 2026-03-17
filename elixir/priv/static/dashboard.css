@@ -138,6 +138,32 @@ pre,
   gap: 1rem;
 }
 
+.flash-stack {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.flash-banner {
+  margin: 0;
+  padding: 0.95rem 1rem;
+  border-radius: 18px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  box-shadow: var(--shadow-sm);
+}
+
+.flash-banner-info {
+  border-color: rgba(16, 163, 127, 0.18);
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+
+.flash-banner-error {
+  border-color: #f6d3cf;
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
 .hero-card,
 .section-card,
 .metric-card,
@@ -330,6 +356,12 @@ body.dashboard-live-disconnected .status-badge-offline {
   align-items: flex-start;
   gap: 1rem;
   flex-wrap: wrap;
+}
+
+.section-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
 }
 
 .section-title {

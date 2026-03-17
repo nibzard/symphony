@@ -41,6 +41,32 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   @impl true
+  def handle_event("reconcile_history", _params, socket) do
+    case Presenter.reconcile_history_payload(orchestrator()) do
+      {:ok, %{success: true} = payload} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, reconcile_history_message(payload))
+         |> assign(:payload, load_payload())
+         |> assign(:now, DateTime.utc_now())}
+
+      {:ok, payload} ->
+        {:noreply,
+         socket
+         |> put_flash(:error, reconcile_history_error(payload))
+         |> assign(:payload, load_payload())
+         |> assign(:now, DateTime.utc_now())}
+
+      {:error, :unavailable} ->
+        {:noreply,
+         socket
+         |> put_flash(:error, "History reconciliation is unavailable because the orchestrator is offline.")
+         |> assign(:payload, load_payload())
+         |> assign(:now, DateTime.utc_now())}
+    end
+  end
+
+  @impl true
   def render(assigns) do
     ~H"""
     <section class="dashboard-shell">
@@ -77,6 +103,15 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </div>
         </div>
       </header>
+
+      <div :if={flash_message(@flash, :info) || flash_message(@flash, :error)} class="flash-stack">
+        <p :if={flash_message(@flash, :info)} class="flash-banner flash-banner-info">
+          <%= flash_message(@flash, :info) %>
+        </p>
+        <p :if={flash_message(@flash, :error)} class="flash-banner flash-banner-error">
+          <%= flash_message(@flash, :error) %>
+        </p>
+      </div>
 
       <%= if @payload[:error] do %>
         <section class="error-card">
@@ -218,6 +253,17 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <div>
               <h2 class="section-title">Runtime history</h2>
               <p class="section-copy">Persisted operator history that survives Symphony restarts.</p>
+            </div>
+
+            <div class="section-actions">
+              <button
+                type="button"
+                class="secondary"
+                phx-click="reconcile_history"
+                phx-disable-with="Reconciling..."
+              >
+                Reconcile history
+              </button>
             </div>
           </div>
 
@@ -670,6 +716,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp format_int(_value), do: "n/a"
 
+  defp flash_message(flash, kind) do
+    Phoenix.Flash.get(flash, kind)
+  end
+
   defp runtime_value(payload, path), do: deep_get(Map.get(payload, :runtime, %{}), path)
   defp history_value(payload, path), do: deep_get(Map.get(payload, :history, %{}), path)
   defp history_sessions(payload), do: Map.get(Map.get(payload, :history, %{}), :recent_sessions, [])
@@ -964,6 +1014,19 @@ defmodule SymphonyElixirWeb.DashboardLive do
       String.contains?(normalized, ["todo", "queued", "pending", "retry"]) -> "#{base} state-badge-warning"
       true -> base
     end
+  end
+
+  defp reconcile_history_message(%{updated_entries: updated_entries} = payload)
+       when is_integer(updated_entries) and updated_entries > 0 do
+    "Reconciled history: repaired #{updated_entries} session entries across #{payload.issues_found || 0} current issues."
+  end
+
+  defp reconcile_history_message(_payload) do
+    "Reconciled history: no stale terminal-session entries needed repair."
+  end
+
+  defp reconcile_history_error(payload) when is_map(payload) do
+    "History reconciliation failed: #{Map.get(payload, :error, "unknown error")}."
   end
 
   defp schedule_runtime_tick do

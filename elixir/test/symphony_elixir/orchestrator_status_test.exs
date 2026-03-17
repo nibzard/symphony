@@ -368,6 +368,79 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert hd(persisted["recent_sessions"])["issue_state"] == "Done"
   end
 
+  test "reconcile_history repairs persisted terminal session history from tracker state" do
+    history_path =
+      Path.join(System.tmp_dir!(), "symphony-observability-history-#{System.unique_integer([:positive])}.json")
+
+    issue = %Issue{
+      id: "issue-history-reconcile",
+      identifier: "MT-270",
+      title: "History reconcile test",
+      description: "Repair stale terminal session state",
+      state: "Done",
+      url: "https://example.org/issues/MT-270"
+    }
+
+    history =
+      SymphonyElixir.ObservabilityHistory.default_history()
+      |> SymphonyElixir.ObservabilityHistory.append_session(%{
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        issue_state: "In Review",
+        session_id: "thread-history-reconcile",
+        started_at: "2026-03-16T11:58:00Z",
+        finished_at: "2026-03-16T12:00:00Z",
+        runtime_seconds: 120,
+        result: "moved to terminal state",
+        totals: %{total_tokens: 42}
+      })
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 5_000,
+      max_concurrent_agents: 4,
+      next_poll_due_at_ms: nil,
+      poll_check_in_progress: false,
+      tick_timer_ref: nil,
+      tick_token: nil,
+      started_at: DateTime.utc_now(),
+      history_path: history_path,
+      codex_command: "codex",
+      codex_runtime_info: %{},
+      running: %{},
+      completed: MapSet.new(),
+      claimed: MapSet.new(),
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      codex_rate_limits: nil,
+      history: history
+    }
+
+    {updated_state, payload} =
+      Orchestrator.reconcile_history_for_test(state, fn [issue_id] ->
+        assert issue_id == issue.id
+        {:ok, [issue]}
+      end)
+
+    assert payload.success == true
+    assert payload.issues_requested == 1
+    assert payload.issues_found == 1
+    assert payload.candidate_entries == 1
+    assert payload.updated_entries == 1
+    assert payload.missing_issues == 0
+
+    [session_entry | _] = updated_state.history.recent_sessions
+    assert session_entry.issue_state == "Done"
+    assert session_entry.stop_reason == "terminal_state"
+    assert session_entry.from_state == "In Review"
+    assert session_entry.to_state == "Done"
+
+    persisted = Jason.decode!(File.read!(history_path))
+    assert hd(persisted["recent_sessions"])["issue_state"] == "Done"
+    assert hd(persisted["recent_sessions"])["stop_reason"] == "terminal_state"
+    assert hd(persisted["recent_sessions"])["from_state"] == "In Review"
+    assert hd(persisted["recent_sessions"])["to_state"] == "Done"
+  end
+
   test "orchestrator snapshot tracks turn completed usage when present" do
     issue_id = "issue-turn-completed-usage"
 

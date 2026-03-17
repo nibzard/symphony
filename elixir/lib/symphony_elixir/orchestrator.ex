@@ -350,6 +350,13 @@ defmodule SymphonyElixir.Orchestrator do
     select_worker_host(state, preferred_worker_host)
   end
 
+  @doc false
+  @spec reconcile_history_for_test(term(), ([String.t()] -> term())) :: {term(), map()}
+  def reconcile_history_for_test(%State{} = state, issue_state_fetcher)
+      when is_function(issue_state_fetcher, 1) do
+    do_reconcile_history(state, issue_state_fetcher)
+  end
+
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
 
   defp reconcile_running_issue_states([issue | rest], state, active_states, terminal_states) do
@@ -1121,6 +1128,20 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @spec request_history_reconcile() :: map() | :unavailable
+  def request_history_reconcile do
+    request_history_reconcile(__MODULE__)
+  end
+
+  @spec request_history_reconcile(GenServer.server()) :: map() | :unavailable
+  def request_history_reconcile(server) do
+    if Process.whereis(server) do
+      GenServer.call(server, :reconcile_history)
+    else
+      :unavailable
+    end
+  end
+
   @spec snapshot() :: map() | :timeout | :unavailable
   def snapshot, do: snapshot(__MODULE__, 15_000)
 
@@ -1210,6 +1231,16 @@ defmodule SymphonyElixir.Orchestrator do
        requested_at: DateTime.utc_now(),
        operations: ["poll", "reconcile"]
      }, state}
+  end
+
+  def handle_call(:reconcile_history, _from, state) do
+    {state, payload} = do_reconcile_history(state, &Tracker.fetch_issue_states_by_ids/1)
+
+    if payload.success and payload.updated_entries > 0 do
+      notify_dashboard()
+    end
+
+    {:reply, payload, state}
   end
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
@@ -1475,6 +1506,63 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp persist_history(_path, _history), do: :ok
+
+  defp do_reconcile_history(%State{} = state, issue_state_fetcher)
+       when is_function(issue_state_fetcher, 1) do
+    requested_at = DateTime.utc_now() |> DateTime.truncate(:second)
+    issue_ids = ObservabilityHistory.reconcilable_session_issue_ids(state.history)
+
+    if issue_ids == [] do
+      {state,
+       %{
+         success: true,
+         requested_at: requested_at,
+         issues_requested: 0,
+         issues_found: 0,
+         candidate_entries: 0,
+         updated_entries: 0,
+         missing_issues: 0
+       }}
+    else
+      case issue_state_fetcher.(issue_ids) do
+        {:ok, issues} when is_list(issues) ->
+          {history, summary} = ObservabilityHistory.reconcile_terminal_session_history(state.history, issues)
+
+          state =
+            if summary.updated_entries > 0 do
+              persist_history(state.history_path, history)
+              %{state | history: history}
+            else
+              state
+            end
+
+          {state,
+           Map.merge(summary, %{
+             success: true,
+             requested_at: requested_at,
+             issues_requested: length(issue_ids)
+           })}
+
+        {:error, reason} ->
+          {state,
+           %{
+             success: false,
+             requested_at: requested_at,
+             issues_requested: length(issue_ids),
+             error: inspect(reason)
+           }}
+
+        other ->
+          {state,
+           %{
+             success: false,
+             requested_at: requested_at,
+             issues_requested: length(issue_ids),
+             error: "unexpected tracker response: #{inspect(other)}"
+           }}
+      end
+    end
+  end
 
   defp due_at_iso8601(due_at_ms) when is_integer(due_at_ms) do
     DateTime.utc_now()

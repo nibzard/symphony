@@ -1,0 +1,20 @@
+[Unit]
+Description=Symphony Prism Orchestrator
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/agent/symphony/elixir
+Environment=PATH=/home/agent/.local/share/mise/shims:/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=%h/.config/symphony/symphony-prism.env
+ExecStart=/home/agent/symphony/elixir/scripts/run_symphony_service.sh /home/agent/prism/WORKFLOW.md
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

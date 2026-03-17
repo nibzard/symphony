@@ -1,0 +1,4 @@
+interface:
+  display_name: "Symphony Ops"
+  short_description: "Start, monitor, and recover Symphony runtimes."
+  default_prompt: "Use $symphony-ops to start, monitor, or recover a Symphony runtime safely."

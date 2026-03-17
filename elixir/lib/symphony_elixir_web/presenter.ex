@@ -58,7 +58,18 @@ defmodule SymphonyElixirWeb.Presenter do
         {:error, :unavailable}
 
       payload ->
-        {:ok, Map.update!(payload, :requested_at, &DateTime.to_iso8601/1)}
+        {:ok, normalize_request_payload(payload)}
+    end
+  end
+
+  @spec reconcile_history_payload(GenServer.name()) :: {:ok, map()} | {:error, :unavailable}
+  def reconcile_history_payload(orchestrator) do
+    case Orchestrator.request_history_reconcile(orchestrator) do
+      :unavailable ->
+        {:error, :unavailable}
+
+      payload ->
+        {:ok, normalize_request_payload(payload)}
     end
   end
 
@@ -199,6 +210,13 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp iso8601(_datetime), do: nil
+
+  defp normalize_request_payload(payload) when is_map(payload) do
+    case Map.get(payload, :requested_at) do
+      %DateTime{} = requested_at -> Map.put(payload, :requested_at, DateTime.to_iso8601(requested_at))
+      _ -> payload
+    end
+  end
 
   defp normalize_history_payload(history) when is_map(history) do
     %{

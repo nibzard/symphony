@@ -56,6 +56,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     def handle_call(:request_refresh, _from, state) do
       {:reply, :unavailable, state}
     end
+
+    def handle_call(:reconcile_history, _from, state) do
+      {:reply, :unavailable, state}
+    end
   end
 
   defmodule StaticOrchestrator do
@@ -74,6 +78,10 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     def handle_call(:request_refresh, _from, state) do
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
+    end
+
+    def handle_call(:reconcile_history, _from, state) do
+      {:reply, Keyword.get(state, :reconcile_history, :unavailable), state}
     end
   end
 
@@ -332,6 +340,15 @@ defmodule SymphonyElixir.ExtensionsTest do
           coalesced: false,
           requested_at: DateTime.utc_now(),
           operations: ["poll", "reconcile"]
+        },
+        reconcile_history: %{
+          success: true,
+          requested_at: DateTime.utc_now(),
+          issues_requested: 2,
+          issues_found: 2,
+          candidate_entries: 3,
+          updated_entries: 1,
+          missing_issues: 0
         }
       )
 
@@ -482,6 +499,20 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
              json_response(conn, 202)
+
+    conn = post(build_conn(), "/api/v1/history/reconcile", %{})
+
+    reconcile_payload = json_response(conn, 200)
+
+    assert reconcile_payload == %{
+             "success" => true,
+             "requested_at" => reconcile_payload["requested_at"],
+             "issues_requested" => 2,
+             "issues_found" => 2,
+             "candidate_entries" => 3,
+             "updated_entries" => 1,
+             "missing_issues" => 0
+           }
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -492,6 +523,9 @@ defmodule SymphonyElixir.ExtensionsTest do
              %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
 
     assert json_response(get(build_conn(), "/api/v1/refresh"), 405) ==
+             %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
+
+    assert json_response(get(build_conn(), "/api/v1/history/reconcile"), 405) ==
              %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
 
     assert json_response(post(build_conn(), "/", %{}), 405) ==
@@ -512,6 +546,14 @@ defmodule SymphonyElixir.ExtensionsTest do
              }
 
     assert json_response(post(build_conn(), "/api/v1/refresh", %{}), 503) ==
+             %{
+               "error" => %{
+                 "code" => "orchestrator_unavailable",
+                 "message" => "Orchestrator is unavailable"
+               }
+             }
+
+    assert json_response(post(build_conn(), "/api/v1/history/reconcile", %{}), 503) ==
              %{
                "error" => %{
                  "code" => "orchestrator_unavailable",
@@ -597,6 +639,15 @@ defmodule SymphonyElixir.ExtensionsTest do
           coalesced: true,
           requested_at: DateTime.utc_now(),
           operations: ["poll"]
+        },
+        reconcile_history: %{
+          success: true,
+          requested_at: DateTime.utc_now(),
+          issues_requested: 1,
+          issues_found: 1,
+          candidate_entries: 1,
+          updated_entries: 1,
+          missing_issues: 0
         }
       )
 
@@ -618,6 +669,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Runtime history"
     assert html =~ "History file"
     assert html =~ "Lifetime tokens"
+    assert html =~ "Reconcile history"
     assert html =~ "Model / effort"
     assert html =~ "Agent CLI"
     assert html =~ "gpt-5.4"
@@ -636,6 +688,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute html =~ "Transport"
     assert html =~ "status-badge-live"
     assert html =~ "status-badge-offline"
+
+    clicked_html = render_click(element(view, "button[phx-click=\"reconcile_history\"]"))
+    assert clicked_html =~ "Reconciled history: repaired 1 session entries across 1 current issues."
 
     updated_snapshot =
       put_in(snapshot.running, [
@@ -829,6 +884,16 @@ defmodule SymphonyElixir.ExtensionsTest do
       operations: ["poll"]
     }
 
+    reconcile_history = %{
+      success: true,
+      requested_at: DateTime.utc_now(),
+      issues_requested: 1,
+      issues_found: 1,
+      candidate_entries: 1,
+      updated_entries: 0,
+      missing_issues: 0
+    }
+
     server_opts = [
       host: "127.0.0.1",
       port: 0,
@@ -836,7 +901,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       snapshot_timeout_ms: 50
     ]
 
-    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot, refresh: refresh})
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot, refresh: refresh, reconcile_history: reconcile_history})
 
     start_supervised!({HttpServer, server_opts})
 
@@ -863,6 +928,15 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert refresh_response.status == 202
     assert refresh_response.body["queued"] == true
+
+    reconcile_response =
+      Req.post!("http://127.0.0.1:#{port}/api/v1/history/reconcile",
+        headers: [{"content-type", "application/x-www-form-urlencoded"}],
+        body: ""
+      )
+
+    assert reconcile_response.status == 200
+    assert reconcile_response.body["success"] == true
 
     method_not_allowed_response =
       Req.post!("http://127.0.0.1:#{port}/api/v1/state",

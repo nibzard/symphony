@@ -1,5 +1,10 @@
 # Symphony Elixir
 
+## Remote Policy
+
+- Never push a PR or branch directly to `upstream`.
+- Push only to the configured fork remote, and treat `upstream` as read-only.
+
 This directory contains the Elixir agent orchestration service that polls Linear, creates per-issue workspaces, and runs Codex in app-server mode.
 
 ## Environment

@@ -4,6 +4,7 @@ defmodule SymphonyElixir.ObservabilityHistory do
   """
 
   require Logger
+  alias SymphonyElixir.Linear.Issue
 
   @session_limit 20
   @retry_limit 40
@@ -83,6 +84,71 @@ defmodule SymphonyElixir.ObservabilityHistory do
     )
   end
 
+  @spec reconcilable_session_issue_ids(map()) :: [String.t()]
+  def reconcilable_session_issue_ids(history) when is_map(history) do
+    history
+    |> Map.get(:recent_sessions, [])
+    |> Enum.flat_map(fn entry ->
+      entry = normalize_session_entry(entry)
+
+      if reconcilable_terminal_session?(entry) and is_binary(entry.issue_id) and entry.issue_id != "" do
+        [entry.issue_id]
+      else
+        []
+      end
+    end)
+    |> Enum.uniq()
+  end
+
+  @spec reconcile_terminal_session_history(map(), [Issue.t() | map()]) :: {map(), map()}
+  def reconcile_terminal_session_history(history, issues)
+      when is_map(history) and is_list(issues) do
+    state_by_issue_id = issue_state_by_id(issues)
+
+    {recent_sessions, summary} =
+      history
+      |> Map.get(:recent_sessions, [])
+      |> Enum.map(&normalize_session_entry/1)
+      |> Enum.map_reduce(
+        %{candidate_entries: 0, updated_entries: 0, missing_issues: MapSet.new()},
+        fn entry, summary ->
+          if reconcilable_terminal_session?(entry) do
+            summary = %{summary | candidate_entries: summary.candidate_entries + 1}
+
+            case Map.get(state_by_issue_id, entry.issue_id) do
+              state when is_binary(state) and state != "" ->
+                updated_entry = reconcile_terminal_session_entry(entry, state)
+
+                summary =
+                  if updated_entry == entry do
+                    summary
+                  else
+                    %{summary | updated_entries: summary.updated_entries + 1}
+                  end
+
+                {updated_entry, summary}
+
+              _ ->
+                summary = %{summary | missing_issues: MapSet.put(summary.missing_issues, entry.issue_id)}
+                {entry, summary}
+            end
+          else
+            {entry, summary}
+          end
+        end
+      )
+
+    {
+      Map.put(history, :recent_sessions, recent_sessions),
+      %{
+        candidate_entries: summary.candidate_entries,
+        updated_entries: summary.updated_entries,
+        issues_found: map_size(state_by_issue_id),
+        missing_issues: MapSet.size(summary.missing_issues)
+      }
+    }
+  end
+
   defp normalize_history(payload) do
     %{
       lifetime_codex_totals: normalize_totals(Map.get(payload, "lifetime_codex_totals")),
@@ -150,6 +216,52 @@ defmodule SymphonyElixir.ObservabilityHistory do
   end
 
   defp normalize_totals(_totals), do: @empty_totals
+
+  defp issue_state_by_id(issues) do
+    Enum.reduce(issues, %{}, fn
+      %Issue{id: issue_id, state: state}, acc when is_binary(issue_id) and is_binary(state) ->
+        Map.put(acc, issue_id, state)
+
+      %{"id" => issue_id, "state" => state}, acc when is_binary(issue_id) and is_binary(state) ->
+        Map.put(acc, issue_id, state)
+
+      %{id: issue_id, state: state}, acc when is_binary(issue_id) and is_binary(state) ->
+        Map.put(acc, issue_id, state)
+
+      _issue, acc ->
+        acc
+    end)
+  end
+
+  defp reconcilable_terminal_session?(entry) do
+    stop_reason = entry[:stop_reason]
+    result = entry[:result]
+
+    (stop_reason == "terminal_state" or result == "moved to terminal state") and
+      is_binary(entry[:issue_id]) and entry[:issue_id] != ""
+  end
+
+  defp reconcile_terminal_session_entry(entry, state) when is_binary(state) do
+    from_state =
+      cond do
+        is_binary(entry[:from_state]) and entry[:from_state] != "" ->
+          entry[:from_state]
+
+        is_binary(entry[:issue_state]) and entry[:issue_state] != state ->
+          entry[:issue_state]
+
+        true ->
+          nil
+      end
+
+    %{
+      entry
+      | issue_state: state,
+        stop_reason: entry[:stop_reason] || "terminal_state",
+        from_state: from_state,
+        to_state: state
+    }
+  end
 
   defp put_totals(history, key, totals) do
     Map.put(history, key, add_totals(history[key] || @empty_totals, normalize_totals(totals)))

@@ -65,6 +65,53 @@ mise exec -- mix build
 mise exec -- ./bin/symphony ./WORKFLOW.md
 ```
 
+## Run as a user service
+
+For long-lived deployments, prefer `systemd --user` over `tmux` so restarts preserve the required
+environment consistently.
+
+This repo includes:
+
+- a launcher: `scripts/run_symphony_service.sh`
+- a service template: `systemd/symphony-prism.service`
+
+Recommended setup:
+
+1. Create an environment file with plain `KEY=value` entries:
+
+```bash
+mkdir -p ~/.config/symphony
+cat > ~/.config/symphony/symphony-prism.env <<'EOF'
+LINEAR_API_KEY=...
+EOF
+chmod 600 ~/.config/symphony/symphony-prism.env
+```
+
+2. Install the user unit:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp systemd/symphony-prism.service ~/.config/systemd/user/symphony-prism.service
+systemctl --user daemon-reload
+systemctl --user enable --now symphony-prism.service
+```
+
+3. Operate it with:
+
+```bash
+systemctl --user status symphony-prism.service
+systemctl --user restart symphony-prism.service
+journalctl --user -u symphony-prism.service -f
+```
+
+Notes:
+
+- `EnvironmentFile=` entries for systemd must use `KEY=value`, not `export KEY=value`.
+- If your shell usually provides `escript`, `mix`, or `mise` through shims, make sure the unit sets
+  a suitable `PATH`. The provided unit does this explicitly.
+- If `tracker.api_key` is set to `$LINEAR_API_KEY` in `WORKFLOW.md`, the service environment must
+  include `LINEAR_API_KEY` or Symphony will poll without being able to talk to Linear.
+
 ## Configuration
 
 Pass a custom workflow file path to `./bin/symphony` when starting the service:
