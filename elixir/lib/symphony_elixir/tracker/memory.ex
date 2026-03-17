@@ -35,9 +35,20 @@ defmodule SymphonyElixir.Tracker.Memory do
      end)}
   end
 
+  @spec find_workpad_comment(String.t()) :: {:ok, map() | nil} | {:error, term()}
+  def find_workpad_comment(issue_id) do
+    {:ok, configured_comments() |> Map.get(issue_id) |> normalize_comment()}
+  end
+
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) do
     send_event({:memory_tracker_comment, issue_id, body})
+    :ok
+  end
+
+  @spec update_comment(String.t(), String.t()) :: :ok | {:error, term()}
+  def update_comment(comment_id, body) do
+    send_event({:memory_tracker_comment_update, comment_id, body})
     :ok
   end
 
@@ -49,6 +60,10 @@ defmodule SymphonyElixir.Tracker.Memory do
 
   defp configured_issues do
     Application.get_env(:symphony_elixir, :memory_tracker_issues, [])
+  end
+
+  defp configured_comments do
+    Application.get_env(:symphony_elixir, :memory_tracker_comments, %{})
   end
 
   defp issue_entries do
@@ -69,4 +84,16 @@ defmodule SymphonyElixir.Tracker.Memory do
   end
 
   defp normalize_state(_state), do: ""
+
+  defp normalize_comment(%{id: id, body: body}) when is_binary(id) and is_binary(body) do
+    %{id: id, body: body}
+  end
+
+  defp normalize_comment(comment) when is_list(comment) do
+    comment
+    |> Enum.into(%{})
+    |> normalize_comment()
+  end
+
+  defp normalize_comment(_comment), do: nil
 end

@@ -41,6 +41,25 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   @impl true
+  def handle_event("refresh_runtime", _params, socket) do
+    case Presenter.refresh_payload(orchestrator()) do
+      {:ok, payload} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, refresh_runtime_message(payload))
+         |> assign(:payload, load_payload())
+         |> assign(:now, DateTime.utc_now())}
+
+      {:error, :unavailable} ->
+        {:noreply,
+         socket
+         |> put_flash(:error, "Runtime refresh is unavailable because the orchestrator is offline.")
+         |> assign(:payload, load_payload())
+         |> assign(:now, DateTime.utc_now())}
+    end
+  end
+
+  @impl true
   def handle_event("reconcile_history", _params, socket) do
     case Presenter.reconcile_history_payload(orchestrator()) do
       {:ok, %{success: true} = payload} ->
@@ -84,22 +103,43 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </p>
           </div>
 
-          <div class="status-stack">
-            <span class="status-badge status-badge-live">
-              <span class="status-badge-dot"></span>
-              Socket live
-            </span>
-            <span class="status-badge status-badge-offline">
-              <span class="status-badge-dot"></span>
-              Socket offline
-            </span>
-            <span class={runtime_health_badge_class(@payload, @now)}>
-              <span class="status-badge-dot"></span>
-              <%= runtime_health_label(@payload, @now) %>
-            </span>
-            <p class="status-detail">
-              Snapshot age <span class="mono numeric"><%= format_age(snapshot_age_seconds(@payload, @now)) %></span>
-            </p>
+          <div class="hero-sidecar">
+            <div class="section-actions hero-actions">
+              <button
+                type="button"
+                class="secondary"
+                phx-click="refresh_runtime"
+                phx-disable-with="Refreshing..."
+              >
+                Refresh runtime
+              </button>
+              <button
+                type="button"
+                class="secondary"
+                phx-click="reconcile_history"
+                phx-disable-with="Reconciling..."
+              >
+                Reconcile history
+              </button>
+            </div>
+
+            <div class="status-stack">
+              <span class="status-badge status-badge-live">
+                <span class="status-badge-dot"></span>
+                Socket live
+              </span>
+              <span class="status-badge status-badge-offline">
+                <span class="status-badge-dot"></span>
+                Socket offline
+              </span>
+              <span class={runtime_health_badge_class(@payload, @now)}>
+                <span class="status-badge-dot"></span>
+                <%= runtime_health_label(@payload, @now) %>
+              </span>
+              <p class="status-detail">
+                Snapshot age <span class="mono numeric"><%= format_age(snapshot_age_seconds(@payload, @now)) %></span>
+              </p>
+            </div>
           </div>
         </div>
       </header>
@@ -163,107 +203,414 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
         </section>
 
-        <section class="section-card">
+        <section class={operator_banner_class(@payload, @now)}>
+          <div class="operator-banner-copy">
+            <p class="operator-banner-label">Operator summary</p>
+            <h2 class="operator-banner-title"><%= operator_banner_title(@payload, @now) %></h2>
+            <p class="operator-banner-body"><%= operator_banner_body(@payload, @now) %></p>
+          </div>
+          <div class="operator-banner-metrics">
+            <div class="operator-banner-stat">
+              <span class="operator-banner-stat-label">Process</span>
+              <span class="operator-banner-stat-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %> tokens</span>
+            </div>
+            <div class="operator-banner-stat">
+              <span class="operator-banner-stat-label">History</span>
+              <span class="operator-banner-stat-value numeric"><%= format_int(history_value(@payload, [:lifetime_codex_totals, :total_tokens])) %> tokens</span>
+            </div>
+          </div>
+        </section>
+
+        <section :if={show_attention_panel?(@payload, @now)} class="section-card section-card-attention">
           <div class="section-header">
             <div>
-              <h2 class="section-title">Runtime identity</h2>
-              <p class="section-copy">Which Symphony instance, workflow, and runtime settings are serving this dashboard.</p>
+              <h2 class="section-title">Needs attention</h2>
+              <p class="section-copy">Operational signals that usually need an operator decision.</p>
             </div>
           </div>
 
-          <div class="identity-grid">
-            <article class="identity-item">
-              <p class="identity-label">Version</p>
-              <p class="identity-value mono"><%= runtime_value(@payload, [:app, :version]) || "n/a" %></p>
-            </article>
-
-            <article class="identity-item">
-              <p class="identity-label">Model / effort</p>
-              <p class="identity-value mono">
-                <%= runtime_value(@payload, [:config, :codex, :model]) || "n/a" %>
-                ·
-                <%= runtime_value(@payload, [:config, :codex, :reasoning_effort]) || "n/a" %>
+          <div class="attention-grid">
+            <article :if={snapshot_stale?(@payload, @now)} class="attention-item attention-item-warning">
+              <h3>Snapshot is stale</h3>
+              <p>
+                The dashboard payload is <span class="mono numeric"><%= format_age(snapshot_age_seconds(@payload, @now)) %></span> old.
+                LiveView is still connected, but Symphony has not published a fresh snapshot recently.
               </p>
             </article>
 
-            <article class="identity-item">
-              <p class="identity-label">Host / pid</p>
-              <p class="identity-value mono">
-                <%= runtime_value(@payload, [:system, :hostname]) || "n/a" %>
-                ·
-                <%= runtime_value(@payload, [:system, :os_pid]) || "n/a" %>
+            <article :if={@payload.counts.retrying > 0} class="attention-item attention-item-warning">
+              <h3>Retry pressure</h3>
+              <p>
+                <span class="mono numeric"><%= @payload.counts.retrying %></span> issues are waiting in the retry queue.
               </p>
             </article>
 
-            <article class="identity-item identity-item-wide">
-              <p class="identity-label">Agent CLI</p>
-              <p class="identity-value mono">
-                <%= runtime_value(@payload, [:config, :codex, :binary_name]) || "n/a" %>
-                <%= if runtime_value(@payload, [:config, :codex, :binary_path]) do %>
-                  · <%= runtime_value(@payload, [:config, :codex, :binary_path]) %>
-                <% end %>
+            <article
+              :for={entry <- stalled_running_entries(@payload, @now)}
+              class="attention-item attention-item-danger"
+            >
+              <h3><%= entry.issue_identifier %> looks stalled</h3>
+              <p>
+                No fresh Codex event for <span class="mono numeric"><%= format_age(session_activity_age_seconds(entry, @now)) %></span>.
               </p>
-              <p class="identity-meta mono muted">
-                <%= runtime_value(@payload, [:config, :codex, :binary_version]) || "version unavailable" %>
-              </p>
-            </article>
-
-            <article class="identity-item identity-item-wide">
-              <p class="identity-label">Workflow</p>
-              <p class="identity-value mono"><%= runtime_value(@payload, [:workflow, :path]) || "n/a" %></p>
-              <p class="identity-meta mono muted">
-                sha <%= short_hash(runtime_value(@payload, [:workflow, :sha256])) %>
-                <%= if runtime_value(@payload, [:workflow, :mtime]) do %>
-                  · mtime <%= runtime_value(@payload, [:workflow, :mtime]) %>
-                <% end %>
-              </p>
-            </article>
-
-            <article class="identity-item identity-item-wide">
-              <p class="identity-label">History file</p>
-              <p class="identity-value mono"><%= runtime_value(@payload, [:runtime, :history_path]) || "n/a" %></p>
-            </article>
-
-            <article class="identity-item">
-              <p class="identity-label">Started</p>
-              <p class="identity-value mono"><%= runtime_value(@payload, [:runtime, :started_at]) || "n/a" %></p>
-            </article>
-
-            <article class="identity-item">
-              <p class="identity-label">Server</p>
-              <p class="identity-value mono">
-                <%= runtime_value(@payload, [:config, :server, :host]) || "n/a" %>:<%= runtime_value(@payload, [:config, :server, :port]) || "n/a" %>
-              </p>
-            </article>
-
-            <article class="identity-item">
-              <p class="identity-label">Concurrency</p>
-              <p class="identity-value mono"><%= runtime_value(@payload, [:config, :agent, :max_concurrent_agents]) || "n/a" %></p>
-            </article>
-
-            <article class="identity-item identity-item-wide">
-              <p class="identity-label">Active states</p>
-              <p class="identity-value"><%= join_list(runtime_value(@payload, [:config, :tracker, :active_states])) %></p>
             </article>
           </div>
         </section>
 
-        <section class="section-card">
+        <div class="live-grid">
+          <div class="live-main">
+            <section class="section-card">
+              <div class="section-header">
+                <div>
+                  <h2 class="section-title">Running sessions</h2>
+                  <p class="section-copy">Active issues, last known agent activity, and token usage.</p>
+                </div>
+              </div>
+
+              <%= if @payload.running == [] do %>
+                <p class="empty-state"><%= running_empty_state(@payload, @now) %></p>
+              <% else %>
+                <div class="table-wrap desktop-table-wrap">
+                  <table class="data-table data-table-running">
+                    <colgroup>
+                      <col style="width: 12rem;" />
+                      <col style="width: 8rem;" />
+                      <col style="width: 7.5rem;" />
+                      <col style="width: 8.5rem;" />
+                      <col />
+                      <col style="width: 10rem;" />
+                    </colgroup>
+                    <thead>
+                      <tr>
+                        <th>Issue</th>
+                        <th>State</th>
+                        <th>Activity</th>
+                        <th>Session</th>
+                        <th>Runtime / turns</th>
+                        <th>Codex update</th>
+                        <th>Tokens</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr :for={entry <- @payload.running}>
+                        <td>
+                          <div class="issue-stack">
+                            <span class="issue-id"><%= entry.issue_identifier %></span>
+                            <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                          </div>
+                        </td>
+                        <td>
+                          <span class={state_badge_class(entry.state)}>
+                            <%= entry.state %>
+                          </span>
+                        </td>
+                        <td>
+                          <div class="detail-stack">
+                            <span class={session_health_badge_class(entry, @now)}>
+                              <%= session_health_label(entry, @now) %>
+                            </span>
+                            <span class="muted">
+                              <%= session_health_detail(entry, @now) %>
+                            </span>
+                          </div>
+                        </td>
+                        <td>
+                          <div class="session-stack">
+                            <%= if entry.session_id do %>
+                              <button
+                                type="button"
+                                class="subtle-button"
+                                data-label="Copy ID"
+                                data-copy={entry.session_id}
+                                onclick="return window.copyDashboardText(this);"
+                              >
+                                Copy ID
+                              </button>
+                            <% else %>
+                              <span class="muted">n/a</span>
+                            <% end %>
+                          </div>
+                        </td>
+                        <td class="numeric"><%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %></td>
+                        <td>
+                          <div class="detail-stack">
+                            <span
+                              class="event-text"
+                              title={entry.last_message || to_string(entry.last_event || "n/a")}
+                            ><%= entry.last_message || to_string(entry.last_event || "n/a") %></span>
+                            <span class="muted event-meta">
+                              <%= entry.last_event || "n/a" %>
+                              <%= if entry.last_event_at do %>
+                                · <span class="mono numeric"><%= entry.last_event_at %></span>
+                              <% end %>
+                            </span>
+                          </div>
+                        </td>
+                        <td>
+                          <div class="token-stack numeric">
+                            <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
+                            <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
+                          </div>
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+
+                <div class="mobile-list">
+                  <article :for={entry <- @payload.running} class="mobile-card">
+                    <div class="mobile-card-header">
+                      <div class="issue-stack">
+                        <span class="issue-id"><%= entry.issue_identifier %></span>
+                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                      </div>
+
+                      <span class={state_badge_class(entry.state)}>
+                        <%= entry.state %>
+                      </span>
+                    </div>
+
+                    <div class="mobile-detail-grid">
+                      <div class="mobile-detail-row">
+                        <span class="mobile-detail-label">Activity</span>
+                        <div class="mobile-detail-value mobile-inline-stack">
+                          <span class={session_health_badge_class(entry, @now)}>
+                            <%= session_health_label(entry, @now) %>
+                          </span>
+                          <span class="muted"><%= session_health_detail(entry, @now) %></span>
+                        </div>
+                      </div>
+
+                      <div class="mobile-detail-row">
+                        <span class="mobile-detail-label">Session</span>
+                        <div class="mobile-detail-value">
+                          <%= if entry.session_id do %>
+                            <button
+                              type="button"
+                              class="subtle-button"
+                              data-label="Copy ID"
+                              data-copy={entry.session_id}
+                              onclick="return window.copyDashboardText(this);"
+                            >
+                              Copy ID
+                            </button>
+                          <% else %>
+                            <span class="muted">n/a</span>
+                          <% end %>
+                        </div>
+                      </div>
+
+                      <div class="mobile-detail-row">
+                        <span class="mobile-detail-label">Runtime and turns</span>
+                        <span class="mobile-detail-value numeric">
+                          <%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %>
+                        </span>
+                      </div>
+
+                      <div class="mobile-detail-row">
+                        <span class="mobile-detail-label">Last update</span>
+                        <div class="mobile-detail-value mobile-inline-stack">
+                          <span class="mobile-event-text">
+                            <%= entry.last_message || to_string(entry.last_event || "n/a") %>
+                          </span>
+                          <span class="muted">
+                            <%= entry.last_event || "n/a" %>
+                            <%= if entry.last_event_at do %>
+                              · <span class="mono numeric"><%= entry.last_event_at %></span>
+                            <% end %>
+                          </span>
+                        </div>
+                      </div>
+
+                      <div class="mobile-detail-row">
+                        <span class="mobile-detail-label">Total tokens</span>
+                        <div class="mobile-detail-value mobile-inline-stack numeric">
+                          <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
+                          <span class="muted">
+                            In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %>
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  </article>
+                </div>
+              <% end %>
+            </section>
+
+            <section class="section-card">
+              <div class="section-header">
+                <div>
+                  <h2 class="section-title">Retry queue</h2>
+                  <p class="section-copy">Issues waiting for the next retry window.</p>
+                </div>
+              </div>
+
+              <%= if @payload.retrying == [] do %>
+                <p class="empty-state"><%= retry_empty_state(@payload, @now) %></p>
+              <% else %>
+                <div class="table-wrap desktop-table-wrap">
+                  <table class="data-table" style="min-width: 680px;">
+                    <thead>
+                      <tr>
+                        <th>Issue</th>
+                        <th>Attempt</th>
+                        <th>Due at</th>
+                        <th>Error</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr :for={entry <- @payload.retrying}>
+                        <td>
+                          <div class="issue-stack">
+                            <span class="issue-id"><%= entry.issue_identifier %></span>
+                            <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                          </div>
+                        </td>
+                        <td><%= entry.attempt %></td>
+                        <td class="mono"><%= entry.due_at || "n/a" %></td>
+                        <td><%= entry.error || "n/a" %></td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+
+                <div class="mobile-list">
+                  <article :for={entry <- @payload.retrying} class="mobile-card mobile-card-muted">
+                    <div class="mobile-card-header">
+                      <div class="issue-stack">
+                        <span class="issue-id"><%= entry.issue_identifier %></span>
+                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                      </div>
+
+                      <span class="state-badge state-badge-warning">Retry</span>
+                    </div>
+
+                    <div class="mobile-detail-grid">
+                      <div class="mobile-detail-row">
+                        <span class="mobile-detail-label">Attempt</span>
+                        <span class="mobile-detail-value numeric"><%= entry.attempt %></span>
+                      </div>
+
+                      <div class="mobile-detail-row">
+                        <span class="mobile-detail-label">Due at</span>
+                        <span class="mobile-detail-value mono"><%= entry.due_at || "n/a" %></span>
+                      </div>
+
+                      <div class="mobile-detail-row">
+                        <span class="mobile-detail-label">Error</span>
+                        <span class="mobile-detail-value"><%= entry.error || "n/a" %></span>
+                      </div>
+                    </div>
+                  </article>
+                </div>
+              <% end %>
+            </section>
+          </div>
+
+          <div class="live-side">
+            <section class="section-card section-card-secondary">
+              <div class="section-header">
+                <div>
+                  <h2 class="section-title">Rate limits</h2>
+                  <p class="section-copy">Latest upstream rate-limit snapshot, when available.</p>
+                </div>
+              </div>
+
+              <pre class="code-panel"><%= pretty_value(@payload.rate_limits) %></pre>
+            </section>
+
+            <section class="section-card section-card-secondary">
+              <div class="section-header">
+                <div>
+                  <h2 class="section-title">Runtime identity</h2>
+                  <p class="section-copy">Version, workflow, and host details for this Symphony runtime.</p>
+                </div>
+              </div>
+
+              <div class="identity-grid">
+                <article class="identity-item">
+                  <p class="identity-label">Version</p>
+                  <p class="identity-value mono"><%= runtime_value(@payload, [:app, :version]) || "n/a" %></p>
+                </article>
+
+                <article class="identity-item">
+                  <p class="identity-label">Model / effort</p>
+                  <p class="identity-value mono">
+                    <%= runtime_value(@payload, [:config, :codex, :model]) || "n/a" %>
+                    ·
+                    <%= runtime_value(@payload, [:config, :codex, :reasoning_effort]) || "n/a" %>
+                  </p>
+                </article>
+
+                <article class="identity-item">
+                  <p class="identity-label">Host / pid</p>
+                  <p class="identity-value mono">
+                    <%= runtime_value(@payload, [:system, :hostname]) || "n/a" %>
+                    ·
+                    <%= runtime_value(@payload, [:system, :os_pid]) || "n/a" %>
+                  </p>
+                </article>
+
+                <article class="identity-item">
+                  <p class="identity-label">Started</p>
+                  <p class="identity-value mono"><%= runtime_value(@payload, [:runtime, :started_at]) || "n/a" %></p>
+                </article>
+
+                <article class="identity-item identity-item-wide">
+                  <p class="identity-label">Workflow</p>
+                  <p class="identity-value mono"><%= runtime_value(@payload, [:workflow, :path]) || "n/a" %></p>
+                  <p class="identity-meta mono muted">
+                    sha <%= short_hash(runtime_value(@payload, [:workflow, :sha256])) %>
+                    <%= if runtime_value(@payload, [:workflow, :mtime]) do %>
+                      · mtime <%= runtime_value(@payload, [:workflow, :mtime]) %>
+                    <% end %>
+                  </p>
+                </article>
+
+                <article class="identity-item identity-item-wide">
+                  <p class="identity-label">Agent CLI</p>
+                  <p class="identity-value mono">
+                    <%= runtime_value(@payload, [:config, :codex, :binary_name]) || "n/a" %>
+                    <%= if runtime_value(@payload, [:config, :codex, :binary_path]) do %>
+                      · <%= runtime_value(@payload, [:config, :codex, :binary_path]) %>
+                    <% end %>
+                  </p>
+                  <p class="identity-meta mono muted">
+                    <%= runtime_value(@payload, [:config, :codex, :binary_version]) || "version unavailable" %>
+                  </p>
+                </article>
+
+                <article class="identity-item">
+                  <p class="identity-label">Server</p>
+                  <p class="identity-value mono">
+                    <%= runtime_value(@payload, [:config, :server, :host]) || "n/a" %>:<%= runtime_value(@payload, [:config, :server, :port]) || "n/a" %>
+                  </p>
+                </article>
+
+                <article class="identity-item">
+                  <p class="identity-label">Concurrency</p>
+                  <p class="identity-value mono"><%= runtime_value(@payload, [:config, :agent, :max_concurrent_agents]) || "n/a" %></p>
+                </article>
+
+                <article class="identity-item identity-item-wide">
+                  <p class="identity-label">History file</p>
+                  <p class="identity-value mono"><%= runtime_value(@payload, [:runtime, :history_path]) || "n/a" %></p>
+                </article>
+
+                <article class="identity-item identity-item-wide">
+                  <p class="identity-label">Active states</p>
+                  <p class="identity-value"><%= join_list(runtime_value(@payload, [:config, :tracker, :active_states])) %></p>
+                </article>
+              </div>
+            </section>
+          </div>
+        </div>
+
+        <section class="section-card section-card-secondary">
           <div class="section-header">
             <div>
               <h2 class="section-title">Runtime history</h2>
               <p class="section-copy">Persisted operator history that survives Symphony restarts.</p>
-            </div>
-
-            <div class="section-actions">
-              <button
-                type="button"
-                class="secondary"
-                phx-click="reconcile_history"
-                phx-disable-with="Reconciling..."
-              >
-                Reconcile history
-              </button>
             </div>
           </div>
 
@@ -359,300 +706,6 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </section>
           </div>
         </section>
-
-        <section :if={show_attention_panel?(@payload, @now)} class="section-card section-card-attention">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Needs attention</h2>
-              <p class="section-copy">Operational signals that usually need an operator decision.</p>
-            </div>
-          </div>
-
-          <div class="attention-grid">
-            <article :if={snapshot_stale?(@payload, @now)} class="attention-item attention-item-warning">
-              <h3>Snapshot is stale</h3>
-              <p>
-                The dashboard payload is <span class="mono numeric"><%= format_age(snapshot_age_seconds(@payload, @now)) %></span> old.
-                LiveView is still connected, but Symphony has not published a fresh snapshot recently.
-              </p>
-            </article>
-
-            <article :if={@payload.counts.retrying > 0} class="attention-item attention-item-warning">
-              <h3>Retry pressure</h3>
-              <p>
-                <span class="mono numeric"><%= @payload.counts.retrying %></span> issues are waiting in the retry queue.
-              </p>
-            </article>
-
-            <article
-              :for={entry <- stalled_running_entries(@payload, @now)}
-              class="attention-item attention-item-danger"
-            >
-              <h3><%= entry.issue_identifier %> looks stalled</h3>
-              <p>
-                No fresh Codex event for <span class="mono numeric"><%= format_age(session_activity_age_seconds(entry, @now)) %></span>.
-              </p>
-            </article>
-          </div>
-        </section>
-
-        <section class="section-card">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Rate limits</h2>
-              <p class="section-copy">Latest upstream rate-limit snapshot, when available.</p>
-            </div>
-          </div>
-
-          <pre class="code-panel"><%= pretty_value(@payload.rate_limits) %></pre>
-        </section>
-
-        <section class="section-card">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Running sessions</h2>
-              <p class="section-copy">Active issues, last known agent activity, and token usage.</p>
-            </div>
-          </div>
-
-          <%= if @payload.running == [] do %>
-            <p class="empty-state">No active sessions.</p>
-          <% else %>
-            <div class="table-wrap desktop-table-wrap">
-              <table class="data-table data-table-running">
-                <colgroup>
-                  <col style="width: 12rem;" />
-                  <col style="width: 8rem;" />
-                  <col style="width: 7.5rem;" />
-                  <col style="width: 8.5rem;" />
-                  <col />
-                  <col style="width: 10rem;" />
-                </colgroup>
-                <thead>
-                  <tr>
-                    <th>Issue</th>
-                    <th>State</th>
-                    <th>Activity</th>
-                    <th>Session</th>
-                    <th>Runtime / turns</th>
-                    <th>Codex update</th>
-                    <th>Tokens</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :for={entry <- @payload.running}>
-                    <td>
-                      <div class="issue-stack">
-                        <span class="issue-id"><%= entry.issue_identifier %></span>
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
-                      </div>
-                    </td>
-                    <td>
-                      <span class={state_badge_class(entry.state)}>
-                        <%= entry.state %>
-                      </span>
-                    </td>
-                    <td>
-                      <div class="detail-stack">
-                        <span class={session_health_badge_class(entry, @now)}>
-                          <%= session_health_label(entry, @now) %>
-                        </span>
-                        <span class="muted">
-                          <%= session_health_detail(entry, @now) %>
-                        </span>
-                      </div>
-                    </td>
-                    <td>
-                      <div class="session-stack">
-                        <%= if entry.session_id do %>
-                          <button
-                            type="button"
-                            class="subtle-button"
-                            data-label="Copy ID"
-                            data-copy={entry.session_id}
-                            onclick="return window.copyDashboardText(this);"
-                          >
-                            Copy ID
-                          </button>
-                        <% else %>
-                          <span class="muted">n/a</span>
-                        <% end %>
-                      </div>
-                    </td>
-                    <td class="numeric"><%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %></td>
-                    <td>
-                      <div class="detail-stack">
-                        <span
-                          class="event-text"
-                          title={entry.last_message || to_string(entry.last_event || "n/a")}
-                        ><%= entry.last_message || to_string(entry.last_event || "n/a") %></span>
-                        <span class="muted event-meta">
-                          <%= entry.last_event || "n/a" %>
-                          <%= if entry.last_event_at do %>
-                            · <span class="mono numeric"><%= entry.last_event_at %></span>
-                          <% end %>
-                        </span>
-                      </div>
-                    </td>
-                    <td>
-                      <div class="token-stack numeric">
-                        <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
-                        <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
-                      </div>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-
-            <div class="mobile-list">
-              <article :for={entry <- @payload.running} class="mobile-card">
-                <div class="mobile-card-header">
-                  <div class="issue-stack">
-                    <span class="issue-id"><%= entry.issue_identifier %></span>
-                    <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
-                  </div>
-
-                  <span class={state_badge_class(entry.state)}>
-                    <%= entry.state %>
-                  </span>
-                </div>
-
-                <div class="mobile-detail-grid">
-                  <div class="mobile-detail-row">
-                    <span class="mobile-detail-label">Activity</span>
-                    <div class="mobile-detail-value mobile-inline-stack">
-                      <span class={session_health_badge_class(entry, @now)}>
-                        <%= session_health_label(entry, @now) %>
-                      </span>
-                      <span class="muted"><%= session_health_detail(entry, @now) %></span>
-                    </div>
-                  </div>
-
-                  <div class="mobile-detail-row">
-                    <span class="mobile-detail-label">Session</span>
-                    <div class="mobile-detail-value">
-                      <%= if entry.session_id do %>
-                        <button
-                          type="button"
-                          class="subtle-button"
-                          data-label="Copy ID"
-                          data-copy={entry.session_id}
-                          onclick="return window.copyDashboardText(this);"
-                        >
-                          Copy ID
-                        </button>
-                      <% else %>
-                        <span class="muted">n/a</span>
-                      <% end %>
-                    </div>
-                  </div>
-
-                  <div class="mobile-detail-row">
-                    <span class="mobile-detail-label">Runtime and turns</span>
-                    <span class="mobile-detail-value numeric">
-                      <%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %>
-                    </span>
-                  </div>
-
-                  <div class="mobile-detail-row">
-                    <span class="mobile-detail-label">Last update</span>
-                    <div class="mobile-detail-value mobile-inline-stack">
-                      <span class="mobile-event-text">
-                        <%= entry.last_message || to_string(entry.last_event || "n/a") %>
-                      </span>
-                      <span class="muted">
-                        <%= entry.last_event || "n/a" %>
-                        <%= if entry.last_event_at do %>
-                          · <span class="mono numeric"><%= entry.last_event_at %></span>
-                        <% end %>
-                      </span>
-                    </div>
-                  </div>
-
-                  <div class="mobile-detail-row">
-                    <span class="mobile-detail-label">Total tokens</span>
-                    <div class="mobile-detail-value mobile-inline-stack numeric">
-                      <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
-                      <span class="muted">
-                        In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %>
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              </article>
-            </div>
-          <% end %>
-        </section>
-
-        <section class="section-card">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Retry queue</h2>
-              <p class="section-copy">Issues waiting for the next retry window.</p>
-            </div>
-          </div>
-
-          <%= if @payload.retrying == [] do %>
-            <p class="empty-state">No issues are currently backing off.</p>
-          <% else %>
-            <div class="table-wrap desktop-table-wrap">
-              <table class="data-table" style="min-width: 680px;">
-                <thead>
-                  <tr>
-                    <th>Issue</th>
-                    <th>Attempt</th>
-                    <th>Due at</th>
-                    <th>Error</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :for={entry <- @payload.retrying}>
-                    <td>
-                      <div class="issue-stack">
-                        <span class="issue-id"><%= entry.issue_identifier %></span>
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
-                      </div>
-                    </td>
-                    <td><%= entry.attempt %></td>
-                    <td class="mono"><%= entry.due_at || "n/a" %></td>
-                    <td><%= entry.error || "n/a" %></td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-
-            <div class="mobile-list">
-              <article :for={entry <- @payload.retrying} class="mobile-card mobile-card-muted">
-                <div class="mobile-card-header">
-                  <div class="issue-stack">
-                    <span class="issue-id"><%= entry.issue_identifier %></span>
-                    <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
-                  </div>
-
-                  <span class="state-badge state-badge-warning">Retry</span>
-                </div>
-
-                <div class="mobile-detail-grid">
-                  <div class="mobile-detail-row">
-                    <span class="mobile-detail-label">Attempt</span>
-                    <span class="mobile-detail-value numeric"><%= entry.attempt %></span>
-                  </div>
-
-                  <div class="mobile-detail-row">
-                    <span class="mobile-detail-label">Due at</span>
-                    <span class="mobile-detail-value mono"><%= entry.due_at || "n/a" %></span>
-                  </div>
-
-                  <div class="mobile-detail-row">
-                    <span class="mobile-detail-label">Error</span>
-                    <span class="mobile-detail-value"><%= entry.error || "n/a" %></span>
-                  </div>
-                </div>
-              </article>
-            </div>
-          <% end %>
-        </section>
       <% end %>
     </section>
     """
@@ -726,6 +779,81 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp history_retries(payload), do: Map.get(Map.get(payload, :history, %{}), :recent_retries, [])
   defp history_session_groups(payload), do: history_sessions(payload) |> group_history_sessions()
   defp history_retry_groups(payload), do: history_retries(payload) |> group_history_retries()
+
+  defp operator_banner_title(%{error: _error}, _now), do: "Dashboard cannot read the runtime"
+
+  defp operator_banner_title(payload, now) do
+    cond do
+      stalled_running_entries(payload, now) != [] -> "Operator action needed"
+      snapshot_stale?(payload, now) -> "Snapshot needs a refresh"
+      payload.counts.retrying > 0 and payload.counts.running == 0 -> "Runtime is healthy, but work is backing off"
+      payload.counts.running > 0 -> "Runtime is actively working"
+      true -> "Runtime is healthy and idle"
+    end
+  end
+
+  defp operator_banner_body(%{error: error}, _now) do
+    "Snapshot requests are failing with #{error.code}. Check the orchestrator process and retry a runtime refresh."
+  end
+
+  defp operator_banner_body(payload, now) do
+    stalled = length(stalled_running_entries(payload, now))
+
+    cond do
+      stalled > 0 ->
+        "#{stalled} running session(s) have gone at least #{format_age(@session_stalled_seconds)} without a fresh Codex event. Check the stalled issue row and recent logs first."
+
+      snapshot_stale?(payload, now) ->
+        "The dashboard payload is #{format_age(snapshot_age_seconds(payload, now))} old. LiveView is connected, but Symphony has not published a fresh snapshot recently."
+
+      payload.counts.retrying > 0 and payload.counts.running == 0 ->
+        "#{payload.counts.retrying} issue(s) are currently backing off. Review retry errors and queue pressure before forcing a restart."
+
+      payload.counts.running > 0 ->
+        "#{payload.counts.running} issue session(s) are active right now. Use the running table below to inspect activity, last events, and token burn."
+
+      true ->
+        "There are no active sessions, no queued retries, and no stalled workers. If you expected activity, confirm that eligible Linear issues exist under the active workflow."
+    end
+  end
+
+  defp operator_banner_class(payload, now) do
+    base = "section-card operator-banner"
+
+    cond do
+      payload[:error] -> "#{base} operator-banner-danger"
+      stalled_running_entries(payload, now) != [] -> "#{base} operator-banner-danger"
+      snapshot_stale?(payload, now) -> "#{base} operator-banner-warning"
+      payload.counts.retrying > 0 -> "#{base} operator-banner-warning"
+      true -> "#{base} operator-banner-good"
+    end
+  end
+
+  defp running_empty_state(payload, now) do
+    cond do
+      payload.counts.retrying > 0 ->
+        "No active sessions right now. Work is currently waiting in the retry queue."
+
+      snapshot_stale?(payload, now) ->
+        "No active sessions are visible in the current snapshot. Refresh the runtime if you expected active work."
+
+      true ->
+        "No active sessions. The runtime currently looks healthy and idle."
+    end
+  end
+
+  defp retry_empty_state(payload, now) do
+    cond do
+      payload.counts.running > 0 ->
+        "No issues are currently backing off. Active work is proceeding without queued retries."
+
+      snapshot_stale?(payload, now) ->
+        "No queued retries are visible in the current snapshot."
+
+      true ->
+        "No issues are currently backing off."
+    end
+  end
 
   defp runtime_health_label(%{error: _error}, _now), do: "Runtime unavailable"
 
@@ -1023,6 +1151,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp reconcile_history_message(_payload) do
     "Reconciled history: no stale terminal-session entries needed repair."
+  end
+
+  defp refresh_runtime_message(%{coalesced: true}) do
+    "Runtime refresh requested. Symphony was already polling or reconciling, so the request was coalesced."
+  end
+
+  defp refresh_runtime_message(_payload) do
+    "Runtime refresh requested. Symphony will poll and reconcile immediately."
   end
 
   defp reconcile_history_error(payload) when is_map(payload) do

@@ -7,9 +7,32 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   alias SymphonyElixir.Linear.Client
 
+  @workpad_heading "## Codex Workpad"
+
+  @find_workpad_comment_query """
+  query SymphonyFindWorkpadComment($issueId: String!) {
+    issue(id: $issueId) {
+      comments(first: 50) {
+        nodes {
+          id
+          body
+        }
+      }
+    }
+  }
+  """
+
   @create_comment_mutation """
   mutation SymphonyCreateComment($issueId: String!, $body: String!) {
     commentCreate(input: {issueId: $issueId, body: $body}) {
+      success
+    }
+  }
+  """
+
+  @update_comment_mutation """
+  mutation SymphonyUpdateComment($commentId: String!, $body: String!) {
+    commentUpdate(id: $commentId, input: {body: $body}) {
       success
     }
   }
@@ -46,6 +69,18 @@ defmodule SymphonyElixir.Linear.Adapter do
   @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids), do: client_module().fetch_issue_states_by_ids(issue_ids)
 
+  @spec find_workpad_comment(String.t()) :: {:ok, map() | nil} | {:error, term()}
+  def find_workpad_comment(issue_id) when is_binary(issue_id) do
+    with {:ok, response} <- client_module().graphql(@find_workpad_comment_query, %{issueId: issue_id}),
+         comments when is_list(comments) <-
+           get_in(response, ["data", "issue", "comments", "nodes"]) do
+      {:ok, Enum.find_value(comments, &normalize_workpad_comment/1)}
+    else
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :comment_lookup_failed}
+    end
+  end
+
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) when is_binary(issue_id) and is_binary(body) do
     with {:ok, response} <- client_module().graphql(@create_comment_mutation, %{issueId: issue_id, body: body}),
@@ -55,6 +90,19 @@ defmodule SymphonyElixir.Linear.Adapter do
       false -> {:error, :comment_create_failed}
       {:error, reason} -> {:error, reason}
       _ -> {:error, :comment_create_failed}
+    end
+  end
+
+  @spec update_comment(String.t(), String.t()) :: :ok | {:error, term()}
+  def update_comment(comment_id, body) when is_binary(comment_id) and is_binary(body) do
+    with {:ok, response} <-
+           client_module().graphql(@update_comment_mutation, %{commentId: comment_id, body: body}),
+         true <- get_in(response, ["data", "commentUpdate", "success"]) == true do
+      :ok
+    else
+      false -> {:error, :comment_update_failed}
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :comment_update_failed}
     end
   end
 
@@ -88,4 +136,15 @@ defmodule SymphonyElixir.Linear.Adapter do
       _ -> {:error, :state_not_found}
     end
   end
+
+  defp normalize_workpad_comment(%{"id" => id, "body" => body})
+       when is_binary(id) and is_binary(body) do
+    if body |> String.trim_leading() |> String.starts_with?(@workpad_heading) do
+      %{id: id, body: body}
+    else
+      nil
+    end
+  end
+
+  defp normalize_workpad_comment(_comment), do: nil
 end

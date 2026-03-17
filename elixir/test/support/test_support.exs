@@ -51,10 +51,13 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :workflow_file_path)
           Application.delete_env(:symphony_elixir, :server_port_override)
           Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+          Application.delete_env(:symphony_elixir, :memory_tracker_comments)
           Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+
           if is_nil(previous_history_path),
             do: Application.delete_env(:symphony_elixir, :observability_history_path),
             else: Application.put_env(:symphony_elixir, :observability_history_path, previous_history_path)
+
           File.rm_rf(workflow_root)
           File.rm(history_path)
         end)
