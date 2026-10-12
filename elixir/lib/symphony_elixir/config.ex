@@ -91,6 +91,14 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @spec project_name() :: String.t()
+  def project_name do
+    case settings() do
+      {:ok, %{name: name}} when is_binary(name) and name != "" -> name
+      _ -> "Symphony"
+    end
+  end
+
   @spec validate!() :: :ok | {:error, term()}
   def validate! do
     with {:ok, settings} <- settings() do

@@ -1,0 +1,20 @@
+[Unit]
+Description=Symphony Loam Orchestrator
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/agent/symphony-loam/elixir
+Environment=PATH=/home/agent/.local/share/mise/shims:/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=%h/.config/symphony/symphony-loam.env
+ExecStart=/home/agent/symphony-loam/elixir/scripts/run_symphony_service.sh /home/agent/loam/WORKFLOW.md /home/agent/.config/symphony/observability_history_loam.json
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

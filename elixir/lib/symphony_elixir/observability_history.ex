@@ -17,7 +17,8 @@ defmodule SymphonyElixir.ObservabilityHistory do
 
   @spec default_path() :: String.t()
   def default_path do
-    Application.get_env(:symphony_elixir, :observability_history_path) ||
+    System.get_env("SYMPHONY_OBSERVABILITY_HISTORY_PATH") ||
+      Application.get_env(:symphony_elixir, :observability_history_path) ||
       Path.join([System.user_home!(), ".config", "symphony", "observability_history.json"])
   end
 

@@ -5,11 +5,13 @@ defmodule SymphonyElixirWeb.Layouts do
 
   use Phoenix.Component
 
+  alias SymphonyElixir.Config
   alias SymphonyElixirWeb.StaticAssets
 
   @spec root(map()) :: Phoenix.LiveView.Rendered.t()
   def root(assigns) do
     assigns = assign(assigns, :csrf_token, Plug.CSRFProtection.get_csrf_token())
+    assigns = assign(assigns, :project_name, Config.project_name())
 
     ~H"""
     <!DOCTYPE html>
@@ -18,7 +20,7 @@ defmodule SymphonyElixirWeb.Layouts do
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <meta name="csrf-token" content={@csrf_token} />
-        <title>Symphony Observability</title>
+        <title>{@project_name} Symphony</title>
         <script defer src={versioned_asset_path("/vendor/phoenix_html/phoenix_html.js")}></script>
         <script defer src={versioned_asset_path("/vendor/phoenix/phoenix.js")}></script>
         <script defer src={versioned_asset_path("/vendor/phoenix_live_view/phoenix_live_view.js")}></script>
